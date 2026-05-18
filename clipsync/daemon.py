@@ -44,6 +44,7 @@ from .config import SettingsStore
 from .core.channels import Channel, ChannelRegistry, ChannelError
 from .core.clipboard import Clipboard, ClipboardError, get_clipboard
 from .core.crypto import CipherRegistry
+from .core.pairing import PairingCallbacks, PairingPeer, PairingService
 from .core.protocol import (
     CONTENT_IMAGE,
     CONTENT_TEXT,
@@ -256,6 +257,24 @@ class Daemon:
         self.on_catalog_changed: callable = lambda channel: None
         self.on_peers_changed: callable = lambda channel: None
 
+        # Pairing service. Wraps PairingCallbacks so the UI sees a single
+        # set of hooks on the daemon (matching the on_catalog_changed style).
+        # The taker path joins the received channel automatically before
+        # firing on_pairing_paired -- so the UI just gets the Channel.
+        self.on_pairing_peers_changed: callable = lambda peers: None
+        self.on_pairing_sas_ready: callable = lambda sas, peer_display: None
+        self.on_pairing_paired: callable = lambda channel: None
+        self.on_pairing_failed: callable = lambda reason: None
+        self._pairing = PairingService(
+            display_name=self._settings.origin_name,
+            callbacks=PairingCallbacks(
+                on_peers_changed=lambda peers: self.on_pairing_peers_changed(peers),
+                on_sas_ready=lambda sas, who: self.on_pairing_sas_ready(sas, who),
+                on_paired=self._handle_pairing_done,
+                on_failed=lambda reason: self.on_pairing_failed(reason),
+            ),
+        )
+
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
@@ -274,6 +293,10 @@ class Daemon:
         self._poll_stop.set()
         # Wake the worker so it exits promptly instead of waiting for an item.
         self._poll_queue.put_nowait(None)
+        try:
+            self._pairing.cancel()
+        except Exception:
+            log.exception("pairing cancel during stop")
         self._transport.stop()
 
     @property
@@ -293,6 +316,76 @@ class Daemon:
     def sync_enabled(self) -> bool:
         with self._sync_lock:
             return self._sync_enabled
+
+    # -- OS clipboard helpers (used by UI for join-string copy/paste) ------
+
+    def copy_text_to_clipboard(self, text: str) -> None:
+        """Place ``text`` on the OS clipboard as UTF-8."""
+        self._clipboard.write(CONTENT_TEXT, text.encode("utf-8"))
+
+    def read_clipboard_text(self) -> Optional[str]:
+        """Return the OS clipboard as text, or None if it isn't text."""
+        item = self._clipboard.read()
+        if item is None:
+            return None
+        content_type, data = item
+        if content_type != CONTENT_TEXT:
+            return None
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    # -- pairing (UI passthrough) ------------------------------------------
+
+    def start_pairing_share(self, channel_name: str) -> None:
+        """Advertise ``channel_name`` for pairing. UI gets on_pairing_sas_ready
+        once a taker connects and the HELLO round completes."""
+        channel = next(
+            (c for c in self._channels.list_channels() if c.name == channel_name),
+            None,
+        )
+        if channel is None:
+            raise ChannelError(f"unknown channel {channel_name!r}")
+        self._pairing.start_share(
+            payload=channel.to_join_string(),
+            label=f"#{channel.name}",
+        )
+
+    def start_pairing_receive(self) -> None:
+        """Browse for nearby pairing peers. UI gets on_pairing_peers_changed
+        as discoveries come in, then calls :meth:`pick_pairing_peer`."""
+        self._pairing.start_receive()
+
+    def pick_pairing_peer(self, peer_id: str) -> None:
+        self._pairing.pick_peer(peer_id)
+
+    def confirm_pairing(self) -> None:
+        self._pairing.confirm()
+
+    def reject_pairing(self) -> None:
+        self._pairing.reject()
+
+    def cancel_pairing(self) -> None:
+        self._pairing.cancel()
+
+    def pairing_peers(self) -> list[PairingPeer]:
+        return self._pairing.peers()
+
+    def _handle_pairing_done(self, payload: Optional[str]) -> None:
+        """Pairing completion glue. Giver side: payload is None, just notify.
+        Taker side: payload is the join string -- install the channel here
+        so the UI just gets the resulting :class:`Channel`."""
+        if payload is None:
+            self.on_pairing_paired(None)
+            return
+        try:
+            channel = self.join_channel(payload)
+        except ChannelError as exc:
+            log.warning("pairing received channel but join failed: %s", exc)
+            self.on_pairing_failed(f"received channel but could not install: {exc}")
+            return
+        self.on_pairing_paired(channel)
 
     # -- channel management (UI passthrough) -------------------------------
 

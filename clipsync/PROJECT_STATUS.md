@@ -80,7 +80,8 @@ clipsync/
 │   ├── crypto.py          # [DONE] per-channel AES-256-GCM + replay defense
 │   ├── channels.py        # [DONE] channel registry, join strings, persistence
 │   ├── transport.py       # [DONE] UDP multicast + TCP networking
-│   └── clipboard.py       # [DONE] abstract read/write/normalize interface
+│   ├── clipboard.py       # [DONE] abstract read/write/normalize interface
+│   └── pairing.py         # [DONE] mDNS + X25519 + SAS pairing for join-string handoff
 ├── platform/
 │   ├── darwin.py          # [DONE] NSPasteboard clipboard impl (PyObjC)
 │   └── linux.py           # [DONE] wl-clipboard / xclip clipboard impl
@@ -238,31 +239,89 @@ The integrity step in `pull()` re-hashes the fetched body and compares to
 the bytes on the wire; this catches any mismatch between the metadata we
 showed in the menu and the body that arrived.
 
+### core/pairing.py — DONE
+
+Short-lived pairing protocol that hands a channel's join string from one
+machine ("giver") to another ("taker") without requiring the user to copy
+or type the `clipsync://` URL.
+
+- **Discovery:** mDNS advertise + browse for `_clipsync-pair._tcp` with
+  TXT records `role`, `display`, `label`. Two backends behind a small ABC
+  in `core/_mdns.py`:
+  - **macOS**: shells out to `/usr/bin/dns-sd` (so we coexist with the
+    system `mDNSResponder` that holds UDP/5353 without `SO_REUSEPORT`).
+  - **Linux / fallback**: pure-Python `zeroconf` (works alongside avahi,
+    which does set `SO_REUSEPORT`, or stands alone).
+- **Key agreement:** ephemeral X25519 over a fresh TCP socket. Both sides
+  exchange HELLO with their public keys and 8-byte nonces.
+- **SAS:** `HKDF-SHA256(shared, info=b"clipsync-pair-sas|" + transcript)`
+  truncated to 4 decimal digits. Transcript pins (initiator_pub,
+  responder_pub, initiator_nonce, responder_nonce) — taker is initiator,
+  giver is responder. Both screens display the SAS; the user verifies a
+  match before clicking Confirm.
+- **Confirm round:** each side sends an AES-GCM-sealed CONFIRM frame
+  (AAD=`b"confirm"`). A LAN MITM would compute different `session_key`s
+  per leg, so its forwarded CONFIRM fails AEAD on the other side.
+- **Transfer:** giver sends a GIFT frame (AAD=`b"gift"`) carrying the
+  channel's `clipsync://` join string sealed under `session_key`. Taker
+  decrypts, installs via `ChannelRegistry.join()`, sends OK (AAD=`b"ok"`),
+  both close.
+- **Defense in depth:** SAS verification is the load-bearing check; AAD
+  prevents replay across message types; ephemeral keys + nonces make each
+  session unique; 2-minute hard session timeout.
+- **Threat model:** same as the rest of the system — LAN outsider in scope,
+  malicious channel member out (inherent to no-server keyed channels).
+
+The module exposes `PairingService` with `start_share(payload, label)` /
+`start_receive()` / `pick_peer(peer_id)` / `confirm()` / `reject()` /
+`cancel()` and four callbacks (`on_peers_changed`, `on_sas_ready`,
+`on_paired`, `on_failed`). The daemon owns one instance and forwards the
+callbacks as `on_pairing_*` hooks the UI installs. The `clipsync://` join
+string remains as the power-user / scripted fallback.
+
+A two-terminal CLI harness lives at `python -m clipsync.core.pairing
+{share,receive}` for protocol smoke testing without UI.
+
 ### ui/menu_darwin.py + ui/tray_linux.py — DONE
 
-Menu structure (agreed):
+Menu structure:
 ```
 📋 ClipSync — #work
 ├── Publish current clipboard
-├── Unpublish last
+├── Unpublish ▸
 ├── ──────────────
 ├── Available on #work ▸           (this list kept fresh by polling)
 │   ├── image · 248 KB · mac-studio · 12s ago     → click = pull
 │   └── text · "Q3 roadmap dr…" · thinkpad · 3m ago
+├── Hide peer item ▸
 ├── ──────────────
-├── Channel: #work ▸               (switch active send channel)
+├── Channels ▸
+│   ├── #work  (active) ▸
+│   │   ├── Set as active
+│   │   ├── View join string…
+│   │   ├── Share via pairing…
+│   │   └── Leave channel
+│   ├── #screenshots ▸
+│   │   └── …
+│   ├── ──────────────
+│   ├── Create channel…
+│   ├── Join from clipboard
+│   └── Receive via pairing…
 ├── Sync: On                       (global pause toggle)
-├── Manage channels…               (create / join via string / leave)
 └── Quit
 ```
 - macOS: `rumps`. Menu rebuilt on a 2s `rumps.Timer` and on daemon callbacks
   (callbacks just flip a dirty flag; the next tick redraws on the main
-  thread). "Manage channels..." is a minimal single-line command surface:
-  `c <name>`, `j <join-string>`, `s <name>`, `l <name>`.
+  thread). Channel management is in-menu — `Create channel…` is a
+  single-field prompt; `Join from clipboard` reads the OS clipboard and
+  parses it. `View join string…` auto-copies the URL.
 - Linux: `PySide6` system tray. Daemon callbacks marshal to the Qt main
-  loop via `QTimer.singleShot(0, ...)`. "Manage channels..." uses
-  `QInputDialog` chooser + follow-up text/item dialogs. Placeholder solid
-  icon; replace with a real asset before shipping.
+  loop via the same dirty-flag pattern. `QInputDialog.getItem` powers the
+  peer picker; `QMessageBox.question` is the SAS confirmation. Placeholder
+  solid icon; replace with a real asset before shipping.
+- Pairing modals (peer pick, SAS confirm, completion notification) are all
+  popped from the tick handler so background daemon threads never touch
+  AppKit / Qt directly.
 
 ---
 

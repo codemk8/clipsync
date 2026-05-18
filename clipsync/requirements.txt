@@ -2,6 +2,7 @@
 
 # --- shared core (both OSes) ---
 cryptography>=42.0          # AES-256-GCM, HKDF for per-channel keys
+zeroconf>=0.130             # mDNS advertise/browse for the pairing flow
 
 # --- macOS only (menu bar app + clipboard access) ---
 # install on macOS with:  pip install rumps pyobjc-framework-Cocoa

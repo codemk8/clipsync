@@ -5,6 +5,7 @@ description = "Cross-OS clipboard sharing over LAN with encrypted channels"
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=42.0",
+    "zeroconf>=0.130",
 ]
 
 [project.optional-dependencies]

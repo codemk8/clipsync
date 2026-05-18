@@ -4,10 +4,12 @@ clipsync.ui.tray_linux
 
 Linux system tray app using PySide6.
 
-Menu structure mirrors the macOS app -- see PROJECT_STATUS.md item 6 for the
-agreed layout. Qt handles nested submenus and dynamic rebuilding well; we
-rebuild on a 2-second QTimer so "12s ago" labels stay current and any change
-flagged by daemon callbacks is picked up shortly after.
+Menu structure mirrors the macOS app: a single ``Channels`` submenu with one
+sub-submenu per channel (Set as active / View join string / Share via
+pairing / Leave channel) and Create / Join from clipboard / Receive via
+pairing at the bottom. Qt handles nested submenus and dynamic rebuilding
+well; we rebuild on a 2-second QTimer so "12s ago" labels stay current and
+any change flagged by daemon callbacks is picked up shortly after.
 
 Threading: daemon callbacks fire from network threads. Qt requires UI
 mutations on the main (GUI) thread, so we marshal them in via a
@@ -78,6 +80,23 @@ class ClipSyncTray(QSystemTrayIcon):
         self._daemon.on_catalog_changed = self._mark_dirty
         self._daemon.on_peers_changed = self._mark_dirty
 
+        # Pairing state: same pattern as macOS -- daemon callbacks set flags
+        # on background threads, the QTimer-driven tick on the GUI thread
+        # is the only place we open Qt modals.
+        self._pairing_active: str | None = None
+        self._pairing_label: str = ""
+        self._pairing_peers_ready: bool = False
+        self._pairing_peer_picked: bool = False
+        self._pairing_pick_min_at: float = 0.0
+        self._pairing_pick_max_at: float = 0.0
+        self._pending_sas: tuple[str, str] | None = None
+        self._pending_result: tuple[str, str] | None = None
+        self._handling_modal = False
+        self._daemon.on_pairing_peers_changed = self._on_pairing_peers
+        self._daemon.on_pairing_sas_ready = self._on_pairing_sas_ready
+        self._daemon.on_pairing_paired = self._on_pairing_paired
+        self._daemon.on_pairing_failed = self._on_pairing_failed
+
         self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(2000)
@@ -88,6 +107,39 @@ class ClipSyncTray(QSystemTrayIcon):
         self._dirty = True
 
     def _tick(self) -> None:
+        # Drain pairing-UI events; Qt modals would re-enter if a second
+        # tick fires while one is up, so we gate with _handling_modal and
+        # surface one event per tick.
+        if not self._handling_modal:
+            if self._pending_result is not None:
+                title, body = self._pending_result
+                self._pending_result = None
+                self.showMessage(
+                    title, body,
+                    QSystemTrayIcon.MessageIcon.Information, 3000,
+                )
+                self._dirty = True
+            elif self._pending_sas is not None:
+                sas, who = self._pending_sas
+                self._pending_sas = None
+                self._handling_modal = True
+                try:
+                    self._prompt_sas(sas, who)
+                finally:
+                    self._handling_modal = False
+                self._dirty = True
+            elif (self._pairing_active == "receive"
+                  and not self._pairing_peer_picked):
+                now = time.monotonic()
+                if now >= self._pairing_pick_max_at or (
+                    now >= self._pairing_pick_min_at and self._pairing_peers_ready
+                ):
+                    self._handling_modal = True
+                    try:
+                        self._show_peer_picker()
+                    finally:
+                        self._handling_modal = False
+
         # Rebuild only when data changed or a young item's "12s ago" label
         # would actually move. On an idle daemon this becomes a no-op.
         if self._dirty or (
@@ -105,17 +157,16 @@ class ClipSyncTray(QSystemTrayIcon):
 
         self._menu.clear()
 
-        publish = QAction("Publish current clipboard", self._menu)
-        publish.triggered.connect(self._publish)
-        publish.setEnabled(active is not None and self._daemon.sync_enabled())
-        self._menu.addAction(publish)
+        # When no channel is joined, the channel-dependent surfaces would
+        # all show "(no channel joined)" placeholders. That reads as broken;
+        # collapse them entirely and let the Channels submenu carry the
+        # path forward.
+        if active is not None:
+            publish = QAction("Publish current clipboard", self._menu)
+            publish.triggered.connect(self._publish)
+            publish.setEnabled(self._daemon.sync_enabled())
+            self._menu.addAction(publish)
 
-        # Unpublish submenu: my own items, click removes from the ring.
-        if active is None:
-            unpub_menu = self._menu.addMenu("Unpublish")
-            placeholder = unpub_menu.addAction("(no channel joined)")
-            placeholder.setEnabled(False)
-        else:
             mine = self._daemon.my_published(active)
             if not mine:
                 unpub_menu = self._menu.addMenu("Unpublish")
@@ -133,14 +184,8 @@ class ClipSyncTray(QSystemTrayIcon):
                     if meta.timestamp > youngest:
                         youngest = meta.timestamp
 
-        self._menu.addSeparator()
+            self._menu.addSeparator()
 
-        # Available items submenu.
-        if active is None:
-            avail = self._menu.addMenu("Available on (no channel)")
-            placeholder = avail.addAction("(no channel joined)")
-            placeholder.setEnabled(False)
-        else:
             avail = self._menu.addMenu(f"Available on #{active}")
             entries = self._daemon.available_items(active)
             if not entries:
@@ -158,8 +203,6 @@ class ClipSyncTray(QSystemTrayIcon):
                 if meta.timestamp > youngest:
                     youngest = meta.timestamp
 
-        # Hide submenu: peer items the user wants suppressed locally.
-        if active is not None:
             my_origin = self._daemon.origin
             peer_entries = [e for e in self._daemon.available_items(active)
                             if e.item.origin != my_origin]
@@ -186,33 +229,54 @@ class ClipSyncTray(QSystemTrayIcon):
                             self._unhide_one(ch, org, sq)
                         )
 
-        self._menu.addSeparator()
+            self._menu.addSeparator()
 
-        # Active-channel submenu.
+        # Channels submenu: each channel is its own sub-submenu with
+        # Set-as-active / View join string / Leave actions; create + join
+        # actions sit at the bottom. Replaces the older multi-step
+        # 'Manage channels...' QInputDialog flow.
+        chan_menu = self._menu.addMenu("Channels")
         channels = self._daemon.list_channels()
-        if not channels:
-            chan_menu = self._menu.addMenu("Channel: (none joined)")
-            placeholder = chan_menu.addAction("Join via 'Manage channels...'")
-            placeholder.setEnabled(False)
-        else:
-            chan_menu = self._menu.addMenu(
-                f"Channel: #{active}" if active else "Channel"
-            )
-            for ch in channels:
-                label = f"#{ch.name}" + ("  (active)" if ch.name == active else "")
-                action = chan_menu.addAction(label)
-                action.triggered.connect(
+        for ch in channels:
+            label = f"#{ch.name}" + ("  (active)" if ch.name == active else "")
+            ch_submenu = chan_menu.addMenu(label)
+
+            set_active = ch_submenu.addAction("Set as active")
+            if ch.name == active:
+                set_active.setEnabled(False)
+            else:
+                set_active.triggered.connect(
                     lambda _checked=False, name=ch.name: self._switch_channel(name)
                 )
+
+            view = ch_submenu.addAction("View join string…")
+            view.triggered.connect(
+                lambda _checked=False, name=ch.name: self._view_join_string(name)
+            )
+
+            share = ch_submenu.addAction("Share via pairing…")
+            share.triggered.connect(
+                lambda _checked=False, name=ch.name: self._share_via_pairing(name)
+            )
+
+            leave = ch_submenu.addAction("Leave channel")
+            leave.triggered.connect(
+                lambda _checked=False, name=ch.name: self._leave_channel_confirm(name)
+            )
+
+        if channels:
+            chan_menu.addSeparator()
+        create = chan_menu.addAction("Create channel…")
+        create.triggered.connect(self._create_channel_prompt)
+        join = chan_menu.addAction("Join from clipboard")
+        join.triggered.connect(self._join_from_clipboard)
+        receive = chan_menu.addAction("Receive via pairing…")
+        receive.triggered.connect(self._receive_via_pairing)
 
         sync_label = "Sync: On" if self._daemon.sync_enabled() else "Sync: Off"
         sync_action = QAction(sync_label, self._menu)
         sync_action.triggered.connect(self._toggle_sync)
         self._menu.addAction(sync_action)
-
-        manage = QAction("Manage channels...", self._menu)
-        manage.triggered.connect(self._manage_channels)
-        self._menu.addAction(manage)
 
         self._menu.addSeparator()
         quit_action = QAction("Quit", self._menu)
@@ -271,69 +335,194 @@ class ClipSyncTray(QSystemTrayIcon):
 
     # -- channel management -------------------------------------------------
 
-    def _manage_channels(self) -> None:
-        options = ["Create channel", "Join via clipsync:// string",
-                   "Show join string", "Leave channel", "Cancel"]
-        choice, ok = QInputDialog.getItem(
-            None, "ClipSync - Manage channels", "Action:",
-            options, 0, False,
-        )
-        if not ok or choice == "Cancel":
+    def _create_channel_prompt(self) -> None:
+        name, ok = QInputDialog.getText(None, "Create channel", "Channel name:")
+        if not ok:
             return
-
+        name = name.strip()
+        if not name:
+            return
         try:
-            if choice == "Create channel":
-                name, ok = QInputDialog.getText(None, "Create channel", "Name:")
-                if ok and name.strip():
-                    ch = self._daemon.create_channel(name.strip())
-                    if self._active_channel is None:
-                        self._active_channel = ch.name
-                    self._show_join_string(ch)
-            elif choice == "Join via clipsync:// string":
-                text, ok = QInputDialog.getText(
-                    None, "Join channel", "Paste clipsync:// join string:",
-                )
-                if ok and text.strip():
-                    ch = self._daemon.join_channel(text.strip())
-                    if self._active_channel is None:
-                        self._active_channel = ch.name
-                    QMessageBox.information(None, "Joined", f"#{ch.name}")
-            elif choice == "Show join string":
-                channels = self._daemon.list_channels()
-                if not channels:
-                    QMessageBox.warning(None, "No channels", "No channels joined.")
-                else:
-                    names = [c.name for c in channels]
-                    name, ok = QInputDialog.getItem(
-                        None, "Show join string", "Channel:", names, 0, False,
-                    )
-                    if ok:
-                        ch = next(c for c in channels if c.name == name)
-                        self._show_join_string(ch)
-            elif choice == "Leave channel":
-                channels = self._daemon.list_channels()
-                if not channels:
-                    return
-                names = [c.name for c in channels]
-                name, ok = QInputDialog.getItem(
-                    None, "Leave channel", "Channel:", names, 0, False,
-                )
-                if ok:
-                    self._daemon.leave_channel(name)
-                    if self._active_channel == name:
-                        chans = self._daemon.list_channels()
-                        self._active_channel = chans[0].name if chans else None
+            channel = self._daemon.create_channel(name)
         except ChannelError as exc:
-            QMessageBox.critical(None, "ClipSync error", str(exc))
-
+            QMessageBox.critical(None, "Could not create channel", str(exc))
+            return
+        if self._active_channel is None:
+            self._active_channel = channel.name
+        self._show_and_copy_join_string(channel)
         self._refresh()
 
-    def _show_join_string(self, ch) -> None:
+    def _view_join_string(self, channel_name: str) -> None:
+        ch = next(
+            (c for c in self._daemon.list_channels() if c.name == channel_name),
+            None,
+        )
+        if ch is None:
+            QMessageBox.warning(None, "Channel not found", channel_name)
+            return
+        self._show_and_copy_join_string(ch)
+
+    def _show_and_copy_join_string(self, channel) -> None:
+        join_string = channel.to_join_string()
+        copied = True
+        try:
+            self._daemon.copy_text_to_clipboard(join_string)
+        except Exception:
+            copied = False
+        footer = "\n\n(Copied to clipboard.)" if copied else ""
         QMessageBox.information(
             None,
-            f"Join string for #{ch.name}",
-            f"Share this with the other machine (out-of-band):\n\n{ch.to_join_string()}",
+            f"Join string for #{channel.name}",
+            f"Share this with the other machine (out-of-band):\n\n"
+            f"{join_string}{footer}",
         )
+
+    def _join_from_clipboard(self) -> None:
+        text = self._daemon.read_clipboard_text()
+        if not text or "clipsync://" not in text:
+            self.showMessage(
+                "ClipSync", "Copy a clipsync:// join string first, then try again.",
+                QSystemTrayIcon.MessageIcon.Warning, 3000,
+            )
+            return
+        try:
+            channel = self._daemon.join_channel(text.strip())
+        except ChannelError as exc:
+            QMessageBox.critical(None, "Could not join channel", str(exc))
+            return
+        if self._active_channel is None:
+            self._active_channel = channel.name
+        self.showMessage(
+            "ClipSync", f"Joined #{channel.name}",
+            QSystemTrayIcon.MessageIcon.Information, 2500,
+        )
+        self._refresh()
+
+    def _leave_channel_confirm(self, channel_name: str) -> None:
+        choice = QMessageBox.question(
+            None,
+            f"Leave #{channel_name}?",
+            "This removes the channel and its secret from this machine. "
+            "Other members are unaffected; you can rejoin later with the "
+            "channel's join string.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._daemon.leave_channel(channel_name)
+        except ChannelError as exc:
+            QMessageBox.critical(None, "Could not leave channel", str(exc))
+            return
+        if self._active_channel == channel_name:
+            chans = self._daemon.list_channels()
+            self._active_channel = chans[0].name if chans else None
+        self._refresh()
+
+    # -- pairing flow -------------------------------------------------------
+
+    def _share_via_pairing(self, channel_name: str) -> None:
+        try:
+            self._daemon.start_pairing_share(channel_name)
+        except (ChannelError, RuntimeError) as exc:
+            QMessageBox.critical(None, "Could not start pairing", str(exc))
+            return
+        self._pairing_active = "share"
+        self._pairing_label = f"#{channel_name}"
+        self._pairing_peers_ready = False
+        self._pairing_peer_picked = False
+        self.showMessage(
+            "ClipSync",
+            f"Sharing {self._pairing_label} — waiting for a nearby device…",
+            QSystemTrayIcon.MessageIcon.Information, 3000,
+        )
+
+    def _receive_via_pairing(self) -> None:
+        try:
+            self._daemon.start_pairing_receive()
+        except RuntimeError as exc:
+            QMessageBox.critical(None, "Could not start pairing", str(exc))
+            return
+        self._pairing_active = "receive"
+        self._pairing_label = ""
+        self._pairing_peers_ready = False
+        self._pairing_peer_picked = False
+        now = time.monotonic()
+        self._pairing_pick_min_at = now + 3.0
+        self._pairing_pick_max_at = now + 8.0
+        self.showMessage(
+            "ClipSync", "Looking for nearby ClipSync devices…",
+            QSystemTrayIcon.MessageIcon.Information, 3000,
+        )
+
+    def _show_peer_picker(self) -> None:
+        peers = self._daemon.pairing_peers()
+        self._pairing_peer_picked = True
+        if not peers:
+            QMessageBox.information(
+                None, "No devices found",
+                "No nearby ClipSync devices were advertising a pairing "
+                "session. Start 'Share via pairing…' on the other machine "
+                "and try again.",
+            )
+            self._daemon.cancel_pairing()
+            self._pairing_active = None
+            return
+        labels = [f"{p.display} — {p.label}" for p in peers]
+        choice, ok = QInputDialog.getItem(
+            None, "Pair with nearby device", "Device:",
+            labels, 0, False,
+        )
+        if not ok:
+            self._daemon.cancel_pairing()
+            self._pairing_active = None
+            return
+        idx = labels.index(choice)
+        self._daemon.pick_pairing_peer(peers[idx].peer_id)
+
+    def _prompt_sas(self, sas: str, peer_display: str) -> None:
+        choice = QMessageBox.question(
+            None,
+            "Verify pairing code",
+            f"Code: {sas}\n\nPeer: {peer_display}\n\n"
+            "Confirm only if BOTH screens show this exact code.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._daemon.confirm_pairing()
+        else:
+            self._daemon.reject_pairing()
+
+    # Background-thread callbacks: set flags only.
+
+    def _on_pairing_peers(self, peers) -> None:
+        if peers:
+            self._pairing_peers_ready = True
+
+    def _on_pairing_sas_ready(self, sas: str, peer_display: str) -> None:
+        self._pending_sas = (sas, peer_display)
+
+    def _on_pairing_paired(self, channel) -> None:
+        if self._pairing_active == "share":
+            self._pending_result = (
+                "Pairing complete",
+                f"{self._pairing_label} shared via pairing.",
+            )
+        else:
+            name = channel.name if channel is not None else "?"
+            self._pending_result = (
+                "Pairing complete",
+                f"Joined #{name} via pairing.",
+            )
+        self._pairing_active = None
+        self._pairing_label = ""
+
+    def _on_pairing_failed(self, reason: str) -> None:
+        self._pending_result = ("Pairing failed", reason)
+        self._pairing_active = None
+        self._pairing_label = ""
 
     # -- shutdown -----------------------------------------------------------
 

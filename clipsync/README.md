@@ -19,6 +19,7 @@ onto the local clipboard:
 | `core/channels.py` — channels + join strings | ✅ done, tested |
 | `core/transport.py` — UDP multicast + TCP | ✅ done |
 | `core/clipboard.py` — clipboard ABC | ✅ done |
+| `core/pairing.py` — mDNS + X25519 + SAS pairing | ✅ done |
 | `platform/darwin.py` — NSPasteboard | ✅ done |
 | `platform/linux.py` — wl-clipboard / xclip | ✅ done |
 | `config.py` — runtime settings | ✅ done |
@@ -32,8 +33,14 @@ See **`PROJECT_STATUS.md`** for the full design rationale and locked decisions.
 
 - **Channels** — named encrypted groups (`#work`, `#screenshots`). A channel is
   just a shared secret; two machines are on the same channel when they hold the
-  same key. You join a channel by pasting a `clipsync://` join string that an
-  existing member shares with you out-of-band.
+  same key.
+- **Two ways to add a second machine to a channel:**
+  - **Pairing (recommended)** — the new machine clicks *Receive via pairing…*,
+    picks the offering device from a list, and both screens display a 4-digit
+    code. Confirm-when-matching defeats LAN MITMs; no copy/paste needed.
+  - **`clipsync://` join string** — the original member exports a URL via
+    *View join string…* and the new machine pastes it under *Join from
+    clipboard*. Survives chat apps and QR codes.
 - **Opt-in push** — nothing leaves your machine until you click *Publish current
   clipboard*. Passwords and one-time codes never sync by accident.
 - **Manual pull** — receivers see what's available on a channel and click to
@@ -82,7 +89,7 @@ Run from the repo root (the directory containing the `clipsync/` package
 folder), so the package import resolves:
 
 ```bash
-python3 -c "from clipsync.core import protocol, crypto, channels, transport, clipboard; print('core OK')"
+python3 -c "from clipsync.core import protocol, crypto, channels, transport, clipboard, pairing; print('core OK')"
 ```
 
 If you get `ModuleNotFoundError: No module named 'cryptography'`, the venv is
@@ -101,12 +108,20 @@ python3 -m clipsync.ui.tray_linux
 python3 -m clipsync.daemon
 ```
 
-First-run flow:
-1. On machine A: *Manage channels...* → `c work` to create a channel.
-   The dialog prints the `clipsync://join?...` string.
-2. On machine B: *Manage channels...* → `j <paste that string>` to join.
-3. On either side: *Publish current clipboard* publishes the OS clipboard.
-4. On the other: open *Available on #work* and click the item to pull it.
+First-run flow (pairing — recommended):
+1. On machine A: *Channels ▸ Create channel…* → enter `work`.
+2. On machine A: *Channels ▸ #work ▸ Share via pairing…*
+3. On machine B: *Channels ▸ Receive via pairing…* → pick A from the list.
+4. Both screens show the same 4-digit code. Confirm on both.
+5. On either side: *Publish current clipboard*. On the other: open
+   *Available on #work* and click the item to pull it.
+
+Fallback flow (join string — works when mDNS is unavailable):
+1. On A: *Channels ▸ #work ▸ View join string…* — copies the `clipsync://`
+   URL to the clipboard automatically.
+2. Send that string to B (chat, email, AirDrop, etc.).
+3. On B (after pasting it into the OS clipboard): *Channels ▸ Join from
+   clipboard*.
 
 ## Layout
 

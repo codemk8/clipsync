@@ -1,0 +1,14 @@
+# ClipSync runtime dependencies
+
+# --- shared core (both OSes) ---
+cryptography>=42.0          # AES-256-GCM, HKDF for per-channel keys
+
+# --- macOS only (menu bar app + clipboard access) ---
+# install on macOS with:  pip install rumps pyobjc-framework-Cocoa
+# rumps>=0.4.0              # NSStatusItem menu bar wrapper
+# pyobjc-framework-Cocoa   # NSPasteboard clipboard access
+
+# --- Linux only (system tray + clipboard access) ---
+# install on Linux with:  pip install PySide6
+# PySide6>=6.5             # Qt system tray + channel management UI
+# clipboard access uses the wl-clipboard / xclip CLI tools (install via OS package manager)
